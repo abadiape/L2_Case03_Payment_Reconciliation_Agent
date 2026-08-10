@@ -1,3 +1,10 @@
 L2_Case03_Payment_Reconciliation_Agent_Brief.docx
 data/*.csv
 data/*.jsonl
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.claude/settings.local.json

@@ -9,14 +9,12 @@ readme = "README.md"
 requires-python = ">=3.11"
 
 dependencies = [
-    "langchain",
-    "langgraph",
-    "fastapi",
     "pydantic",
-    "deepdiff",
     "pytest",
     "pytest-asyncio",
+    "pyright",
     "ruff",
-    "mypy",
-    "httpx"
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

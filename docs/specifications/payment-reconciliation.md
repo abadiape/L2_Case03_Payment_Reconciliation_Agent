@@ -30,4 +30,3 @@ For these use [reconciliation policy](../data/reconciliation_policy.md) numerals
 - Passing pytest-asyncio output covering the loop, mocked tool calls, recovery, and escalation.
 - Observability evidence: traces or structured logs sufficient to reconstruct any record's path.
 - REFLECTION.md, 600-1000 words, six sections. The failure sections carry the most weight.
-

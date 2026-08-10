@@ -1,0 +1,6 @@
+{
+  "include": ["starter/agent_skeleton.py", "starter/test_agent_skeleton.py"],
+  "typeCheckingMode": "strict",
+  "venvPath": ".",
+  "venv": ".venv"
+}
