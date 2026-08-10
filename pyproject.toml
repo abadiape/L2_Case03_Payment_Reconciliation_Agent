@@ -1,0 +1,22 @@
+[project]
+name = "payment-reconciliation-agent"
+version = "0.1.0"
+description = "Reconciles the payment processor's settlements against the internal ledger"
+authors = [
+    {name = "Pedro Abadia"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "langchain",
+    "langgraph",
+    "fastapi",
+    "pydantic",
+    "deepdiff",
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+    "httpx"
+]
