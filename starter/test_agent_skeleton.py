@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ledger_api
 from agent_skeleton import (
     ESCALATION_PATH,
-    REPORT_PATH,
     LedgerEntryDict,
     LedgerNotFound,
     LedgerResponseInvalid,
@@ -20,20 +19,23 @@ from agent_skeleton import (
     escalate_node,
     fetch_node,
     reconcile_node,
+    report_path_for_period,
     run_all,
     validate_response,
 )
+
+TEST_REPORT_PATH = report_path_for_period("2026-03")
 
 
 @pytest.fixture(autouse=True)
 def _reset_ledger_and_escalation() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction] - autouse fixture
     ledger_api.reset()
-    for path in (ESCALATION_PATH, REPORT_PATH):
+    for path in (ESCALATION_PATH, TEST_REPORT_PATH):
         if path.exists():
             path.unlink()
     yield
     ledger_api.reset()
-    for path in (ESCALATION_PATH, REPORT_PATH):
+    for path in (ESCALATION_PATH, TEST_REPORT_PATH):
         if path.exists():
             path.unlink()
 
@@ -342,6 +344,14 @@ class TestEscalateNode:
 # --- run_all: the full loop, and the two graded invariants -----------------
 
 class TestRunAll:
+    async def test_escalation_file_rewritten_fresh_each_run_no_leftovers(self) -> None:
+        """Re-running the same period must not append duplicate blocks on top
+        of a previous run's ESCALATION.md — each run starts clean."""
+        await run_all(period="2026-03", today="2026-04-05", decide=_accept)
+        await run_all(period="2026-03", today="2026-04-05", decide=_accept)
+        content = ESCALATION_PATH.read_text(encoding="utf-8")
+        assert content.count("## PAY-4023 / ORD-70023") == 1
+
     async def test_totals_add_up_to_input_count(self) -> None:
         report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
         accounted = (
@@ -413,7 +423,7 @@ class TestRunAll:
 
     async def test_report_file_written_with_full_breakdown(self) -> None:
         report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
-        content = REPORT_PATH.read_text(encoding="utf-8")
+        content = report_path_for_period(report["period"]).read_text(encoding="utf-8")
         assert "amount_mismatch" in content
         assert "Ledger Service Timeout" in content
         assert "Ledger Response Invalid" in content

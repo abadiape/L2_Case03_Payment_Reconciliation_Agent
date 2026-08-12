@@ -37,9 +37,15 @@ async def fetch_ledger_entry(order_ref: str) -> object:
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 PAYMENTS = DATA_DIR / "processor_payments.csv"
 POLICY = DATA_DIR / "reconciliation_policy.md"
-ESCALATION_PATH = Path(__file__).resolve().parent.parent / "ESCALATION.md"
-LOG_PATH = Path(__file__).resolve().parent.parent / "reconciliation.log"
-REPORT_PATH = Path(__file__).resolve().parent.parent / "RECONCILIATION_REPORT.md"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ESCALATION_PATH = REPO_ROOT / "ESCALATION.md"
+LOG_PATH = REPO_ROOT / "reconciliation.log"
+
+
+def report_path_for_period(period: str) -> Path:
+    """Each period gets its own report file, so a later run never overwrites
+    an earlier period's evidence."""
+    return REPO_ROOT / f"RECONCILIATION_REPORT_{period}.md"
 
 AMOUNT_TOLERANCE = 0.02
 MAX_ATTEMPTS = 3
@@ -458,6 +464,7 @@ async def run_all(
     all_payments = _load_payments()
     period = _resolve_period(period, all_payments)
     today_date = _resolve_today(today)
+    ESCALATION_PATH.unlink(missing_ok=True)  # every run starts clean — no leftovers from any prior run
     logger.info("run_started period=%s today=%s", period, today_date.isoformat())
 
     payments = [p for p in all_payments if p["settled_date"].startswith(period)]
@@ -559,7 +566,7 @@ def _write_report_file(report: ReconciliationReport) -> None:
             lines.append(f"- {r['payment_id']} / {r['order_ref']}: {r['last_error']}")
         lines.append("")
 
-    REPORT_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report_path_for_period(report["period"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _print_report(report: ReconciliationReport) -> None:
@@ -573,7 +580,7 @@ def _print_report(report: ReconciliationReport) -> None:
     print(f"  Escalated: {len(report['escalated'])}")
     for reason, group in sorted(report["escalated_by_reason"].items()):
         print(f"    {reason}: {len(group)}")
-    print(f"\nFull report written to {REPORT_PATH}")
+    print(f"\nFull report written to {report_path_for_period(report['period'])}")
 
 
 if __name__ == "__main__":
