@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ledger_api
 from agent_skeleton import (
     ESCALATION_PATH,
+    REPORT_PATH,
     LedgerEntryDict,
     LedgerNotFound,
     LedgerResponseInvalid,
@@ -27,12 +28,14 @@ from agent_skeleton import (
 @pytest.fixture(autouse=True)
 def _reset_ledger_and_escalation() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction] - autouse fixture
     ledger_api.reset()
-    if ESCALATION_PATH.exists():
-        ESCALATION_PATH.unlink()
+    for path in (ESCALATION_PATH, REPORT_PATH):
+        if path.exists():
+            path.unlink()
     yield
     ledger_api.reset()
-    if ESCALATION_PATH.exists():
-        ESCALATION_PATH.unlink()
+    for path in (ESCALATION_PATH, REPORT_PATH):
+        if path.exists():
+            path.unlink()
 
 
 def make_ledger_entry(**overrides: object) -> LedgerEntryDict:
@@ -59,10 +62,13 @@ def make_state(**overrides: object) -> ReconState:
         "attempts": 0,
         "attempt_log": [],
         "last_error": None,
+        "last_error_type": None,
+        "last_raw_response": None,
         "not_found": False,
-        "duplicate_payment_ids": [],
+        "duplicate_of": None,
         "status": "",
         "exception_class": None,
+        "escalation_reason": None,
         "evidence": "",
     }
     state.update(overrides)  # type: ignore[typeddict-item]
@@ -108,13 +114,18 @@ class TestValidateResponse:
         assert entry["amount"] == 28.2
         assert entry["entry_id"] == "LED-9"
 
-    def test_null_required_field_rejected(self) -> None:
-        """ORD-70005 shape: currency arrives as null."""
-        with pytest.raises(LedgerResponseInvalid):
+    def test_null_required_field_rejected_with_clear_message(self) -> None:
+        """ORD-70005 shape: currency arrives as null. The error must name the
+        missing field and the actual value received, not relay pydantic's raw
+        internal wording (e.g. "Input should be a valid string")."""
+        with pytest.raises(LedgerResponseInvalid) as excinfo:
             validate_response({
                 "entry_id": "LED-5", "order_ref": "ORD-5", "amount": 312.75,
                 "currency": None, "posted_date": "2026-03-04", "entry_type": "sale",
             })
+        message = str(excinfo.value)
+        assert "currency" in message
+        assert "None" in message
 
     def test_non_iso_date_rejected(self) -> None:
         """ORD-70016 shape: posted_date reformatted to DD/MM/YYYY."""
@@ -131,6 +142,17 @@ class TestValidateResponse:
             "currency": "GBP", "posted_date": "2026-03-03", "entry_type": "sale",
         })
         assert entry["amount"] == 1240.0
+
+    @pytest.mark.parametrize("bad_amount", ["NaN", "Infinity", "-Infinity", float("nan"), float("inf")])
+    def test_non_finite_amount_rejected(self, bad_amount: object) -> None:
+        """A NaN/Infinity amount must never reach reconcile_node: abs(nan - x) is
+        always False, so an unvalidated NaN would silently pass tolerance and be
+        marked reconciled without ever being verified."""
+        with pytest.raises(LedgerResponseInvalid):
+            validate_response({
+                "entry_id": "LED-1", "order_ref": "ORD-1", "amount": bad_amount,
+                "currency": "GBP", "posted_date": "2026-03-10", "entry_type": "sale",
+            })
 
     def test_non_dict_response_rejected(self) -> None:
         with pytest.raises(LedgerResponseInvalid):
@@ -236,11 +258,12 @@ class TestReconcileNode:
 
     def test_duplicate_settlement_takes_priority(self) -> None:
         state = make_state(
-            duplicate_payment_ids=["PAY-OTHER"],
+            duplicate_of="PAY-ORIGINAL",
             ledger_entry=make_ledger_entry(amount=100.0),
         )
         result = reconcile_node(state)
         assert result["exception_class"] == "duplicate_settlement"
+        assert "PAY-ORIGINAL" in result["evidence"]
 
     def test_refund_reconciles_normally(self) -> None:
         state = make_state(
@@ -352,12 +375,18 @@ class TestRunAll:
         ord_70020 = next(r for r in all_records if r["order_ref"] == "ORD-70020")
         assert ord_70020["status"] != "escalated"
 
-    async def test_duplicate_settlement_detected(self) -> None:
-        """PAY-4010/PAY-4011 both claim ORD-70010."""
+    async def test_duplicate_settlement_flagged_once_not_twice(self) -> None:
+        """PAY-4010/PAY-4011 both claim ORD-70010. Only the later payment (the
+        duplicate) should be flagged — the earlier one is the presumed original
+        and reconciles normally, so Rina reviews one exception, not two."""
         report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
         duplicate_class = report["exceptions_by_class"].get("duplicate_settlement", [])
-        order_refs = {r["order_ref"] for r in duplicate_class}
-        assert "ORD-70010" in order_refs
+        assert len(duplicate_class) == 1
+        assert duplicate_class[0]["payment_id"] == "PAY-4011"
+
+        all_records = report["reconciled"] + report["exceptions"]
+        original = next(r for r in all_records if r["payment_id"] == "PAY-4010")
+        assert original["status"] == "reconciled"
 
     async def test_unmatched_payments_reported_not_dropped(self) -> None:
         """ORD-70012/ORD-70013 have no ledger entry at all."""
@@ -371,3 +400,22 @@ class TestRunAll:
         report = await run_all(period="2026-03", today="2026-04-05", decide=_no_one_present)
         assert len(report["exceptions"]) == 0
         assert len(report["awaiting_approval"]) > 0
+
+    async def test_escalations_classified_by_reason(self) -> None:
+        """ORD-70023 (persistent TimeoutError) and ORD-70005/ORD-70016 (persistent
+        validation failures) must land in distinct, generically-named buckets."""
+        report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
+        timeout_refs = {r["order_ref"] for r in report["escalated_by_reason"].get("Ledger Service Timeout", [])}
+        invalid_refs = {r["order_ref"] for r in report["escalated_by_reason"].get("Ledger Response Invalid", [])}
+        assert "ORD-70023" in timeout_refs
+        assert {"ORD-70005", "ORD-70016"} <= invalid_refs
+        assert timeout_refs.isdisjoint(invalid_refs)
+
+    async def test_report_file_written_with_full_breakdown(self) -> None:
+        report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
+        content = REPORT_PATH.read_text(encoding="utf-8")
+        assert "amount_mismatch" in content
+        assert "Ledger Service Timeout" in content
+        assert "Ledger Response Invalid" in content
+        for r in report["exceptions"]:
+            assert r["payment_id"] in content

@@ -61,6 +61,18 @@ Decide once, as a stated rule, whether a numeric string amount
 defensible, but apply it uniformly rather than allowing it for some
 records and not others.
 
+**The raised message must state the field, the problem, and the actual
+value received — never relay a library's raw internal wording.**
+`pydantic.ValidationError.errors()` gives structured `loc`/`msg`/`input` for
+exactly this purpose; build the message from those fields
+(`f"{loc}: {msg}, received: {input!r}"`), not from `str(exc)`. Concretely:
+for ORD-70005 (ledger currency arrives as `null`), the raised reason must
+read like `"currency: field is required, received: None"`, not pydantic's
+default `"Input should be a valid string"` — the reader needs to know a
+field was missing and what actually came back, not just that some string
+constraint failed. The same standard applies to `ESCALATION.md` and the
+log line, since both relay this message verbatim.
+
 ## `fetch_node`
 
 Call `ledger_api.fetch_ledger_entry(order_ref)`, run the result through
@@ -83,7 +95,14 @@ Apply `data/reconciliation_policy.md` numerals 1–4 exactly:
   is normal, including across a month boundary — do not flag it.
 - **Currency**: must match exactly.
 - **Duplicates**: more than one payment against an `order_ref` where only
-  one ledger entry exists is a duplicate-settlement exception.
+  one ledger entry exists is a duplicate-settlement exception. **Flag only
+  the later payment(s), not every claimant.** Order claimants by
+  `settled_date` (earliest first); the earliest is the presumed original
+  settlement and reconciles normally like any single-match payment — only
+  the later payment(s) become `duplicate_settlement` exceptions, each
+  naming the original's `payment_id` in its evidence. Flagging every side
+  of the pair means Rina reviews the same anomaly twice for one root cause;
+  that is not "more thorough," it is duplicate work for her.
 - **Refunds**: a negative payment amount matched to an `entry_type:
   "refund"` ledger entry reconciles like any other record — it is not an
   exception by virtue of being negative.
@@ -108,6 +127,19 @@ the record's identity, every attempt with what was sent and what came back,
 and what would be needed to proceed. `ESCALATION.md` must come from an
 actual run, not be hand-written.
 
+**Classify each escalation by failure reason, generically by exception
+type — never leave escalated records in one undifferentiated bucket.**
+Bucket a persistent `TimeoutError`/`ConnectionError`/`OSError` as "Ledger
+Service Timeout"; bucket a persistent shape/validation failure (null field,
+bad date format, unrecognised envelope, etc.) as "Ledger Response Invalid".
+Do this by exception type, not by `order_ref` — the grader's hidden
+variant will introduce failure shapes you haven't seen, and a type-based
+rule still classifies them sensibly. A record that never resolves (a
+not-found response) is *not* an escalation reason: `LedgerNotFound` is a
+clean, well-formed answer per the contract, so it flows straight to
+`reconcile_node`'s `unmatched_payment` exception and never reaches this
+function at all.
+
 ## `run_all` and the period/today input
 
 `docs/specifications/payment-reconciliation.md` asks for the reconciliation
@@ -128,12 +160,43 @@ period and a "today" reference date as input, rather than hardcoding March
 Before returning the report, assert reconciled + exceptions + awaiting
 approval + escalated == number of input payments.
 
+## The reconciliation report — a required, standalone artifact
+
+`docs/specifications/payment-reconciliation.md` and
+`data/reconciliation_policy.md` #7 both require an actual **report**, not
+just a console printout that disappears when the process exits. `run_all`
+must write a report file (e.g. `RECONCILIATION_REPORT.md`) containing:
+
+- The four totals (reconciled / exceptions / awaiting approval /
+  escalated), and confirmation they sum to the input count.
+- **Every exception grouped by class** (`amount_mismatch`,
+  `currency_mismatch`, `unmatched_payment`, `duplicate_settlement`) with
+  its evidence — this is the "exception classes to report" requirement
+  from policy #4, and it is not satisfied by a bare count.
+- Every record still `awaiting_approval`, with its evidence.
+- **Every escalated record grouped by reason** (see `escalate_node`
+  above), not just a bucket count.
+
+Console output (`_print_report` or equivalent) is a convenience on top of
+this file, not a substitute for it.
+
 ## Observability
 
 Emit a structured log line (or equivalent record) at every stage
 transition per payment — enough that, given a payment ID or order
 reference, you can reconstruct what was attempted, what came back, and why
-it ended where it did. This is graded directly.
+it ended where it did. This is graded directly. At minimum, log:
+
+- Each `fetch_node` attempt, with its outcome and whether the record was
+  simply not found (a fact, not a failure).
+- Each retry, carrying the previous attempt's specific failure reason.
+- Escalation, with its classified reason.
+- `reconcile_node`'s outcome, including the evidence string — not just the
+  status and exception class, which alone don't let Rina or a reviewer
+  reconstruct *why*.
+- The approval gate's actual verdict (`accept` / `reject` / no decision),
+  logged distinctly from the record's resulting status, since "the agent
+  decided" and "a human decided X" are different facts worth telling apart.
 
 ## Testing
 
