@@ -129,12 +129,25 @@ class TestValidateResponse:
         assert "currency" in message
         assert "None" in message
 
-    def test_non_iso_date_rejected(self) -> None:
-        """ORD-70016 shape: posted_date reformatted to DD/MM/YYYY."""
+    def test_day_month_year_date_accepted(self) -> None:
+        """ORD-70016 shape: posted_date reformatted to DD/MM/YYYY. This is an
+        equivalent representation of the same date (this ledger's own GBP-
+        locale convention), not a different fact — accepted like a numeric-
+        string amount, not rejected as a shape violation."""
+        entry = validate_response({
+            "entry_id": "LED-16", "order_ref": "ORD-16", "amount": 300.0,
+            "currency": "GBP", "posted_date": "09/03/2026", "entry_type": "sale",
+        })
+        assert entry["posted_date"] == "2026-03-09"
+
+    def test_invalid_day_month_year_date_rejected(self) -> None:
+        """A slash-separated date with an out-of-range day/month (e.g. month
+        25) is not a valid day/month/year reading either — still rejected,
+        not silently guessed at."""
         with pytest.raises(LedgerResponseInvalid):
             validate_response({
                 "entry_id": "LED-16", "order_ref": "ORD-16", "amount": 300.0,
-                "currency": "GBP", "posted_date": "09/03/2026", "entry_type": "sale",
+                "currency": "GBP", "posted_date": "13/25/2026", "entry_type": "sale",
             })
 
     def test_formatted_numeric_string_amount_accepted(self) -> None:
@@ -235,12 +248,12 @@ class TestReconcileNode:
         state = make_state(amount=100.0, ledger_entry=make_ledger_entry(amount=100.05))
         result = reconcile_node(state)
         assert result["status"] == "exception"
-        assert result["exception_class"] == "amount_mismatch"
+        assert result["exception_class"] == "Amount mismatch"
 
     def test_currency_mismatch_takes_priority_over_amount(self) -> None:
         state = make_state(amount=100.0, currency="EUR", ledger_entry=make_ledger_entry(amount=100.0))
         result = reconcile_node(state)
-        assert result["exception_class"] == "currency_mismatch"
+        assert result["exception_class"] == "Currency mismatch"
 
     def test_posting_within_three_days_is_not_an_exception(self) -> None:
         """Policy #3: a post within 3 days of settlement, including across a month
@@ -256,7 +269,7 @@ class TestReconcileNode:
     def test_unmatched_payment_when_not_found(self) -> None:
         state = make_state(not_found=True)
         result = reconcile_node(state)
-        assert result["exception_class"] == "unmatched_payment"
+        assert result["exception_class"] == "Unmatched payment"
 
     def test_duplicate_settlement_takes_priority(self) -> None:
         state = make_state(
@@ -264,7 +277,7 @@ class TestReconcileNode:
             ledger_entry=make_ledger_entry(amount=100.0),
         )
         result = reconcile_node(state)
-        assert result["exception_class"] == "duplicate_settlement"
+        assert result["exception_class"] == "Duplicate settlement"
         assert "PAY-ORIGINAL" in result["evidence"]
 
     def test_refund_reconciles_normally(self) -> None:
@@ -285,12 +298,12 @@ class TestApprovalNode:
         assert result["status"] == "reconciled"
 
     async def test_accept_keeps_exception_status(self) -> None:
-        state = make_state(status="exception", exception_class="amount_mismatch")
+        state = make_state(status="exception", exception_class="Amount mismatch")
         result = await approval_node(state, decide=_accept)
         assert result["status"] == "exception"
 
     async def test_reject_reclassifies_as_reconciled(self) -> None:
-        state = make_state(status="exception", exception_class="amount_mismatch", evidence="diff 0.03")
+        state = make_state(status="exception", exception_class="Amount mismatch", evidence="diff 0.03")
         result = await approval_node(state, decide=_reject)
         assert result["status"] == "reconciled"
         assert result["exception_class"] is None
@@ -298,7 +311,7 @@ class TestApprovalNode:
 
     async def test_no_decision_halts_at_awaiting_approval(self) -> None:
         """No human present: the gate must halt, not resolve on its own authority."""
-        state = make_state(status="exception", exception_class="amount_mismatch")
+        state = make_state(status="exception", exception_class="Amount mismatch")
         result = await approval_node(state, decide=_no_one_present)
         assert result["status"] == "awaiting_approval"
 
@@ -306,17 +319,33 @@ class TestApprovalNode:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Proves the default path is a real blocking prompt, not a rubber stamp."""
-        state = make_state(status="exception", exception_class="amount_mismatch", evidence="diff 0.03")
+        state = make_state(status="exception", exception_class="Amount mismatch", evidence="diff 0.03")
         calls: list[str] = []
 
         def fake_input(prompt: str) -> str:
             calls.append(prompt)
-            return "a"
+            return "y"
 
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
         monkeypatch.setattr("builtins.input", fake_input)
         result = await approval_node(state)
         assert calls, "approval_node must call input() when a human is present"
+        assert result["status"] == "exception"
+
+    async def test_blank_input_defaults_to_confirming_the_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pressing Enter with no input is the safe default: it keeps the
+        record flagged as an exception rather than silently reconciling
+        something nobody actually reviewed."""
+        state = make_state(status="exception", exception_class="Amount mismatch", evidence="diff 0.03")
+
+        def blank_input(prompt: str) -> str:
+            return ""
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", blank_input)
+        result = await approval_node(state)
         assert result["status"] == "exception"
 
 
@@ -390,7 +419,7 @@ class TestRunAll:
         duplicate) should be flagged — the earlier one is the presumed original
         and reconciles normally, so Rina reviews one exception, not two."""
         report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
-        duplicate_class = report["exceptions_by_class"].get("duplicate_settlement", [])
+        duplicate_class = report["exceptions_by_class"].get("Duplicate settlement", [])
         assert len(duplicate_class) == 1
         assert duplicate_class[0]["payment_id"] == "PAY-4011"
 
@@ -401,7 +430,7 @@ class TestRunAll:
     async def test_unmatched_payments_reported_not_dropped(self) -> None:
         """ORD-70012/ORD-70013 have no ledger entry at all."""
         report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
-        unmatched_class = report["exceptions_by_class"].get("unmatched_payment", [])
+        unmatched_class = report["exceptions_by_class"].get("Unmatched payment", [])
         order_refs = {r["order_ref"] for r in unmatched_class}
         assert "ORD-70012" in order_refs
         assert "ORD-70013" in order_refs
@@ -412,19 +441,33 @@ class TestRunAll:
         assert len(report["awaiting_approval"]) > 0
 
     async def test_escalations_classified_by_reason(self) -> None:
-        """ORD-70023 (persistent TimeoutError) and ORD-70005/ORD-70016 (persistent
-        validation failures) must land in distinct, generically-named buckets."""
+        """ORD-70023 (persistent TimeoutError) and ORD-70005 (persistent null-
+        currency validation failure) must land in distinct, generically-named
+        buckets. ORD-70016 is deliberately absent from both: its day/month/year
+        date is an accepted format, not a failure — see
+        test_slash_date_accepted_surfaces_real_currency_mismatch."""
         report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
         timeout_refs = {r["order_ref"] for r in report["escalated_by_reason"].get("Ledger Service Timeout", [])}
         invalid_refs = {r["order_ref"] for r in report["escalated_by_reason"].get("Ledger Response Invalid", [])}
         assert "ORD-70023" in timeout_refs
-        assert {"ORD-70005", "ORD-70016"} <= invalid_refs
+        assert "ORD-70005" in invalid_refs
         assert timeout_refs.isdisjoint(invalid_refs)
+
+    async def test_slash_date_accepted_surfaces_real_currency_mismatch(self) -> None:
+        """ORD-70016 arrives with posted_date as DD/MM/YYYY instead of ISO —
+        an accepted alternate format, like the string-formatted amounts, so it
+        proceeds to reconcile_node rather than exhausting retries. Its real
+        business problem (EUR payment vs GBP ledger) then correctly surfaces
+        as a Currency mismatch instead of an unrelated escalation."""
+        report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
+        currency_class = report["exceptions_by_class"].get("Currency mismatch", [])
+        assert "ORD-70016" in {r["order_ref"] for r in currency_class}
+        assert "ORD-70016" not in {r["order_ref"] for r in report["escalated"]}
 
     async def test_report_file_written_with_full_breakdown(self) -> None:
         report = await run_all(period="2026-03", today="2026-04-05", decide=_accept)
         content = report_path_for_period(report["period"]).read_text(encoding="utf-8")
-        assert "amount_mismatch" in content
+        assert "Amount mismatch" in content
         assert "Ledger Service Timeout" in content
         assert "Ledger Response Invalid" in content
         for r in report["exceptions"]:

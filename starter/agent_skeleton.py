@@ -12,6 +12,7 @@ import asyncio
 import csv
 import json
 import logging
+import re
 import sys
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
@@ -19,7 +20,7 @@ from datetime import date
 from pathlib import Path
 from typing import TypedDict, cast
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ledger_api
@@ -117,6 +118,9 @@ class ReconciliationReport(TypedDict):
     escalated_by_reason: dict[str, list[ReconState]]
 
 
+_DAY_MONTH_YEAR = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+
+
 class LedgerEntry(BaseModel):
     """The documented ledger contract, exactly as specified in ledger_api.fetch_ledger_entry."""
 
@@ -126,6 +130,19 @@ class LedgerEntry(BaseModel):
     currency: str
     posted_date: date
     entry_type: str
+
+    @field_validator("posted_date", mode="before")
+    @classmethod
+    def _accept_day_month_year_slashes(cls, value: object) -> object:
+        """The contract specifies YYYY-MM-DD, but day/month/year with slashes
+        (this ledger's own convention, matching its GBP-denominated locale) is
+        an equivalent representation of the same date, not a different fact —
+        parsed the same way a numeric-string amount is accepted rather than
+        rejected. An invalid day/month still fails naturally below."""
+        if isinstance(value, str) and (match := _DAY_MONTH_YEAR.match(value)):
+            day, month, year = (int(part) for part in match.groups())
+            return date(year, month, day)
+        return value
 
 
 class LedgerNotFound(Exception):
@@ -229,22 +246,23 @@ def reconcile_node(state: ReconState) -> ReconState:
     earliest claimant is the presumed original settlement and is reconciled
     normally, so Rina reviews one exception per duplicate pair rather than
     seeing both sides of the same anomaly twice.
-    Posting-vs-settlement timing is recorded as evidence but never gates a
-    decision here: policy #3 treats a post within 3 days (including across
-    a month boundary) as normal, so nothing in this function is allowed to
-    turn that gap into an exception.
+    Posting-vs-settlement timing is never evaluated here: policy #3 treats a
+    post within 3 days (including across a month boundary) as normal, so it
+    is not a matching criterion and carries no decision weight to record.
+    Exception class names match data/reconciliation_policy.md's own wording
+    exactly (numeral 4), since they're read verbatim by Rina in the report.
     """
     evidence: list[str] = []
     duplicate_of = state.get("duplicate_of")
     entry = state.get("ledger_entry")
 
     if duplicate_of is not None:
-        exception_class = "duplicate_settlement"
+        exception_class = "Duplicate settlement"
         evidence.append(
             f"order_ref {state['order_ref']} already settled by payment {duplicate_of}"
         )
     elif state.get("not_found"):
-        exception_class = "unmatched_payment"
+        exception_class = "Unmatched payment"
         evidence.append(f"no ledger entry found for order_ref {state['order_ref']}")
     else:
         assert entry is not None, "reconcile_node reached the matched branch without a ledger entry"
@@ -253,17 +271,11 @@ def reconcile_node(state: ReconState) -> ReconState:
             f"payment {state['amount']} {state['currency']} vs ledger {entry['amount']} "
             f"{entry['currency']} (diff {amount_diff:.2f})"
         )
-        posted = date.fromisoformat(entry["posted_date"])
-        settled = date.fromisoformat(state["settled_date"])
-        evidence.append(
-            f"settled {settled.isoformat()}, posted {posted.isoformat()} "
-            f"({abs((posted - settled).days)}d — informational, not a matching criterion)"
-        )
 
         if state["currency"] != entry["currency"]:
-            exception_class = "currency_mismatch"
+            exception_class = "Currency mismatch"
         elif amount_diff > AMOUNT_TOLERANCE:
-            exception_class = "amount_mismatch"
+            exception_class = "Amount mismatch"
         else:
             exception_class = None
 
@@ -284,12 +296,12 @@ async def _prompt_for_decision(state: ReconState) -> str | None:
     print(f"\nException: {state['payment_id']} / {state['order_ref']} — {state['exception_class']}")
     print(f"Evidence: {state['evidence']}")
     while True:
-        raw = input("Accept as exception, or reject (a/r)? ").strip().lower()
-        if raw in ("a", "accept"):
+        raw = input("Confirm this exception? (Y/n): ").strip().lower()
+        if raw in ("", "y", "yes"):
             return "accept"
-        if raw in ("r", "reject"):
+        if raw in ("n", "no"):
             return "reject"
-        print("Please answer 'a' (accept) or 'r' (reject).")
+        print("Please answer 'y' or 'n' (blank = yes).")
 
 
 async def approval_node(

@@ -61,6 +61,17 @@ Decide once, as a stated rule, whether a numeric string amount
 defensible, but apply it uniformly rather than allowing it for some
 records and not others.
 
+The same reasoning applies to `posted_date` arriving as `DD/MM/YYYY`
+(slashes) instead of ISO — it is an equivalent representation of the same
+date (this ledger's own GBP-locale convention), not a different fact, so
+accept it the same way a numeric-string amount is accepted rather than
+rejected. This is *not* the same risk as guessing an ambiguous format
+blind: the transform is always day-first, matching both the stub's own
+mutation and standard UK/European convention, so commit to that reading
+consistently rather than trying both orderings. A day/month that's still
+out of range after that reading (e.g. month 25) fails naturally and stays
+rejected — never silently coerced into *some* date just to keep going.
+
 **The raised message must state the field, the problem, and the actual
 value received — never relay a library's raw internal wording.**
 `pydantic.ValidationError.errors()` gives structured `loc`/`msg`/`input` for
@@ -86,20 +97,28 @@ here, so this stays unit-testable with a mocked `fetch_ledger_entry`.
 
 ## `reconcile_node`
 
-Apply `data/reconciliation_policy.md` numerals 1–4 exactly:
+Apply `data/reconciliation_policy.md` numerals 1–4 exactly. **Name each
+exception class with the policy's own wording, verbatim** (`"Amount
+mismatch"`, `"Currency mismatch"`, `"Unmatched payment"`, `"Duplicate
+settlement"`) — not a snake_case translation of it. These strings are read
+directly by Rina in the report and evidence text, so they should match the
+document she already owns rather than requiring her to map a code-ism back
+to the policy in her head.
 
 - **Tolerance**: amounts within 0.02 absolute → reconciled on that axis; a
   gap of 0.02 or less is not an exception, and reporting it is a false
   positive.
 - **Timing**: a ledger post within 3 calendar days of the settlement date
-  is normal, including across a month boundary — do not flag it.
+  is normal, including across a month boundary — do not flag it, and don't
+  record it in evidence either. It is not a matching criterion at all, so
+  restating "Xd, informational" on every record is noise, not evidence.
 - **Currency**: must match exactly.
 - **Duplicates**: more than one payment against an `order_ref` where only
-  one ledger entry exists is a duplicate-settlement exception. **Flag only
-  the later payment(s), not every claimant.** Order claimants by
+  one ledger entry exists is a "Duplicate settlement" exception. **Flag
+  only the later payment(s), not every claimant.** Order claimants by
   `settled_date` (earliest first); the earliest is the presumed original
   settlement and reconciles normally like any single-match payment — only
-  the later payment(s) become `duplicate_settlement` exceptions, each
+  the later payment(s) become "Duplicate settlement" exceptions, each
   naming the original's `payment_id` in its evidence. Flagging every side
   of the pair means Rina reviews the same anomaly twice for one root cause;
   that is not "more thorough," it is duplicate work for her.
@@ -107,8 +126,9 @@ Apply `data/reconciliation_policy.md` numerals 1–4 exactly:
   "refund"` ledger entry reconciles like any other record — it is not an
   exception by virtue of being negative.
 
-Attach evidence to every non-reconciled record: the payment's fields, the
-ledger entry's fields (raw and normalized), and which specific rule fired.
+Attach evidence to every non-reconciled record: the payment's fields and
+the ledger entry's fields (raw and normalized) for whichever rule fired —
+nothing that doesn't affect the classification belongs in the evidence.
 Rina approves or rejects from that evidence alone — she shouldn't have to
 re-derive your reasoning.
 
@@ -137,7 +157,7 @@ variant will introduce failure shapes you haven't seen, and a type-based
 rule still classifies them sensibly. A record that never resolves (a
 not-found response) is *not* an escalation reason: `LedgerNotFound` is a
 clean, well-formed answer per the contract, so it flows straight to
-`reconcile_node`'s `unmatched_payment` exception and never reaches this
+`reconcile_node`'s "Unmatched payment" exception and never reaches this
 function at all.
 
 ## `run_all` and the period/today input
@@ -165,14 +185,16 @@ approval + escalated == number of input payments.
 `docs/specifications/payment-reconciliation.md` and
 `data/reconciliation_policy.md` #7 both require an actual **report**, not
 just a console printout that disappears when the process exits. `run_all`
-must write a report file (e.g. `RECONCILIATION_REPORT.md`) containing:
+must write a report file, one per period (e.g. `RECONCILIATION_REPORT_2026-03.md`)
+so a later run never overwrites an earlier period's evidence, containing:
 
 - The four totals (reconciled / exceptions / awaiting approval /
   escalated), and confirmation they sum to the input count.
-- **Every exception grouped by class** (`amount_mismatch`,
-  `currency_mismatch`, `unmatched_payment`, `duplicate_settlement`) with
-  its evidence — this is the "exception classes to report" requirement
-  from policy #4, and it is not satisfied by a bare count.
+- **Every exception grouped by class** ("Amount mismatch", "Currency
+  mismatch", "Unmatched payment", "Duplicate settlement" — the policy's own
+  wording, verbatim) with its evidence — this is the "exception classes to
+  report" requirement from policy #4, and it is not satisfied by a bare
+  count.
 - Every record still `awaiting_approval`, with its evidence.
 - **Every escalated record grouped by reason** (see `escalate_node`
   above), not just a bucket count.
